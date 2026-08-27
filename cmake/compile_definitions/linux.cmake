@@ -160,6 +160,8 @@ if(X11_FOUND)
     include_directories(SYSTEM ${X11_INCLUDE_DIR})
     list(APPEND PLATFORM_LIBRARIES ${X11_LIBRARIES})
     list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/cursor_shape.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/cursor_shape.cpp"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.h"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.cpp")
 endif()

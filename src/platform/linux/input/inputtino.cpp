@@ -119,6 +119,11 @@ namespace platf {
       caps |= platform_caps::controller_touch;
     }
 
+    // Cursor shape updates need an X11 display with XFixes
+    if (platf::cursor_shape_supported()) {
+      caps |= platform_caps::cursor_shape;
+    }
+
     return caps;
   }
 

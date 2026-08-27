@@ -4,8 +4,10 @@
  */
 
 // standard includes
+#include <atomic>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <queue>
 
 // lib includes
@@ -49,6 +51,7 @@ extern "C" {
 #define IDX_SET_MOTION_EVENT 13
 #define IDX_SET_RGB_LED 14
 #define IDX_SET_ADAPTIVE_TRIGGERS 15
+#define IDX_CURSOR_SHAPE 16
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -67,7 +70,14 @@ static const short packetTypes[] = {
   0x5501,  // Set motion event (Sunshine protocol extension)
   0x5502,  // Set RGB LED (Sunshine protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5504,  // Cursor shape (Sunshine protocol extension)
 };
+
+// Client feature flag (x-ml-general.featureFlags): the client draws a local cursor and wants cursor shape updates.
+// Mirrors ML_FF_LOCAL_CURSOR in moonlight-common-c's Limelight-internal.h once that lands.
+#ifndef ML_FF_LOCAL_CURSOR
+  #define ML_FF_LOCAL_CURSOR 0x04
+#endif
 
 namespace asio = boost::asio;
 namespace sys = boost::system;
@@ -210,6 +220,22 @@ namespace stream {
 
     // Sunshine protocol extension
     SS_HDR_METADATA metadata;
+  };
+
+  // Sunshine protocol extension: host cursor shape for clients drawing a local cursor.
+  // Followed by `nameLength` bytes of UTF-8 name and `dataLength` bytes of image data.
+  struct control_cursor_shape_t {
+    control_header_v2 header;
+
+    std::uint8_t format;  // platf::cursor_shape_format
+    std::uint8_t flags;  // reserved (bit 0: animated), always 0
+    std::uint16_t nominalSize;
+    std::uint16_t width;
+    std::uint16_t height;
+    std::uint16_t hotX;
+    std::uint16_t hotY;
+    std::uint16_t nameLength;
+    std::uint32_t dataLength;
   };
 
   typedef struct control_encrypted_t {
@@ -402,6 +428,10 @@ namespace stream {
 
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
+
+      bool local_cursor;  // Client draws its own cursor and receives cursor shape updates
+      std::uint64_t cursor_shape_sent_gen;  // platf::cursor_shape_t::generation last sent (0 = none)
+      bool cursor_hidden_sent;  // Last message told the client to hide its cursor
     } control;
 
     std::uint32_t launch_session_id;
@@ -418,13 +448,7 @@ namespace stream {
    * returns empty string_view on failure
    * returns string_view pointing to payload data
    */
-  template<std::size_t max_payload_size>
-  static inline std::string_view encode_control(session_t *session, const std::string_view &plaintext, std::array<std::uint8_t, max_payload_size> &tagged_cipher) {
-    static_assert(
-      max_payload_size >= sizeof(control_encrypted_t) + sizeof(crypto::cipher::tag_size),
-      "max_payload_size >= sizeof(control_encrypted_t) + sizeof(crypto::cipher::tag_size)"
-    );
-
+  static inline std::string_view encode_control(session_t *session, const std::string_view &plaintext, std::uint8_t *tagged_cipher) {
     if (session->config.controlProtocolType != 13) {
       return plaintext;
     }
@@ -452,7 +476,7 @@ namespace stream {
       iv[0] = (std::uint8_t) seq;
     }
 
-    auto packet = (control_encrypted_p) tagged_cipher.data();
+    auto packet = (control_encrypted_p) tagged_cipher;
 
     auto bytes = session->control.cipher.encrypt(plaintext, packet->payload(), &iv);
     if (bytes <= 0) {
@@ -466,7 +490,17 @@ namespace stream {
     packet->length = util::endian::little(packet_length);
     packet->seq = util::endian::little(seq);
 
-    return std::string_view {(char *) tagged_cipher.data(), packet_length + sizeof(control_encrypted_t) - sizeof(control_encrypted_t::seq)};
+    return std::string_view {(char *) tagged_cipher, packet_length + sizeof(control_encrypted_t) - sizeof(control_encrypted_t::seq)};
+  }
+
+  template<std::size_t max_payload_size>
+  static inline std::string_view encode_control(session_t *session, const std::string_view &plaintext, std::array<std::uint8_t, max_payload_size> &tagged_cipher) {
+    static_assert(
+      max_payload_size >= sizeof(control_encrypted_t) + sizeof(crypto::cipher::tag_size),
+      "max_payload_size >= sizeof(control_encrypted_t) + sizeof(crypto::cipher::tag_size)"
+    );
+
+    return encode_control(session, plaintext, tagged_cipher.data());
   }
 
   int start_broadcast(broadcast_ctx_t &ctx);
@@ -914,6 +948,62 @@ namespace stream {
     return 0;
   }
 
+  /**
+   * @brief Send the host cursor shape (or a hide request) to a client drawing a local cursor.
+   * @param session The session.
+   * @param shape The shape to send, or `nullptr` to tell the client to hide its cursor.
+   */
+  int send_cursor_shape(session_t *session, const std::shared_ptr<const platf::cursor_shape_t> &shape) {
+    if (!session->control.peer) {
+      return -1;
+    }
+
+    const std::string *name = shape ? &shape->name : nullptr;
+    const std::vector<std::uint8_t> *data = shape ? &shape->data : nullptr;
+    std::size_t name_len = name ? name->size() : 0;
+    std::size_t data_len = data ? data->size() : 0;
+
+    std::vector<std::uint8_t> plaintext(sizeof(control_cursor_shape_t) + name_len + data_len);
+    auto msg = (control_cursor_shape_t *) plaintext.data();
+    msg->header.type = packetTypes[IDX_CURSOR_SHAPE];
+    msg->header.payloadLength = plaintext.size() - sizeof(control_header_v2);
+    if (shape) {
+      msg->format = shape->format;
+      msg->nominalSize = shape->nominal_size;
+      msg->width = shape->width;
+      msg->height = shape->height;
+      msg->hotX = shape->hot_x;
+      msg->hotY = shape->hot_y;
+      msg->nameLength = name_len;
+      msg->dataLength = data_len;
+      std::copy_n(name->data(), name_len, (char *) (msg + 1));
+      std::copy_n(data->data(), data_len, (std::uint8_t *) (msg + 1) + name_len);
+    } else {
+      msg->format = platf::cursor_shape_format::hidden;
+    }
+
+    // The encrypted packet carries a 16-bit length
+    if (plaintext.size() + sizeof(control_encrypted_t) + crypto::cipher::tag_size + 16 > std::numeric_limits<std::uint16_t>::max()) {
+      BOOST_LOG(warning) << "Cursor shape too large to send ("sv << plaintext.size() << " bytes)"sv;
+      return -1;
+    }
+
+    std::vector<std::uint8_t> encrypted_payload(sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(plaintext.size()) + crypto::cipher::tag_size);
+    auto payload = encode_control(session, std::string_view {(char *) plaintext.data(), plaintext.size()}, encrypted_payload.data());
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send cursor shape to ["sv << addr << ':' << port << ']';
+      return -1;
+    }
+
+    BOOST_LOG(verbose) << "Sent cursor shape: format "sv << (int) msg->format << " \""sv << (name ? *name : ""s) << "\" "sv << plaintext.size() << " bytes"sv;
+    return 0;
+  }
+
+  // Sessions whose client draws a local cursor. While any exist the host cursor is not composited
+  // into the video and the control loop polls for cursor shape changes at a higher rate.
+  static std::atomic<int> local_cursor_sessions {0};
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -1119,6 +1209,21 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            if (session->control.local_cursor && session->control.peer) {
+              // While the host cursor is composited into the video (Ctrl+Alt+Shift+N) the client
+              // must not draw one too; otherwise keep the client's cursor in sync with ours.
+              if (display_cursor) {
+                if (!session->control.cursor_hidden_sent && send_cursor_shape(session, nullptr) == 0) {
+                  session->control.cursor_hidden_sent = true;
+                }
+              } else if (auto shape = platf::current_cursor_shape(); shape && (session->control.cursor_hidden_sent || shape->generation != session->control.cursor_shape_sent_gen)) {
+                if (send_cursor_shape(session, shape) == 0) {
+                  session->control.cursor_shape_sent_gen = shape->generation;
+                  session->control.cursor_hidden_sent = false;
+                }
+              }
+            }
           }
 
           ++pos;
@@ -1131,7 +1236,8 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      // Poll faster while a client is waiting on cursor shape updates; they are latency-sensitive
+      server->iterate(local_cursor_sessions > 0 ? 16ms : 150ms);
     }
 
     // Let all remaining connections know the server is shutting down
@@ -1769,6 +1875,8 @@ namespace stream {
     video_packets.reset();
     audio_packets.reset();
 
+    platf::cursor_shape_stop();
+
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
     ctx.recv_thread.join();
     BOOST_LOG(debug) << "Waiting for main video thread to end..."sv;
@@ -1920,6 +2028,10 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
 
+      if (session.control.local_cursor && --local_cursor_sessions == 0) {
+        display_cursor = true;
+      }
+
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
@@ -1973,6 +2085,15 @@ namespace stream {
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
+      if (session.control.local_cursor) {
+        platf::cursor_shape_start();
+        if (local_cursor_sessions++ == 0) {
+          // The client draws the cursor; stop compositing ours into the video
+          display_cursor = false;
+          BOOST_LOG(info) << "Client draws a local cursor; host cursor capture disabled (Ctrl+Alt+Shift+N re-enables it)"sv;
+        }
+      }
+
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {
         platf::streaming_will_start();
@@ -1997,6 +2118,9 @@ namespace stream {
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
       session->control.hdr_queue = mail->event<video::hdr_info_t>(mail::hdr);
+      session->control.local_cursor = (config.mlFeatureFlags & ML_FF_LOCAL_CURSOR) && (platf::get_capabilities() & platf::platform_caps::cursor_shape);
+      session->control.cursor_shape_sent_gen = 0;
+      session->control.cursor_hidden_sent = false;
       session->control.legacy_input_enc_iv = launch_session.iv;
       session->control.cipher = crypto::cipher::gcm_t {
         launch_session.gcm_key,

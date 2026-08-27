@@ -8,8 +8,10 @@
 #include <bitset>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -278,7 +280,55 @@ namespace platf {
 
     constexpr caps_t pen_touch = 0x01;  // Pen and touch events
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
+    constexpr caps_t cursor_shape = 0x04;  // Host can send cursor shape updates (SS_CURSOR_SHAPE control message)
   };  // namespace platform_caps
+
+  /**
+   * @brief Cursor shape formats carried by the SS_CURSOR_SHAPE control message.
+   */
+  namespace cursor_shape_format {
+    constexpr std::uint8_t hidden = 0;  ///< No local cursor should be shown.
+    constexpr std::uint8_t named = 1;  ///< Well-known cursor name only; the client renders a native cursor.
+    constexpr std::uint8_t argb = 2;  ///< 32bpp premultiplied ARGB raster (uint32 0xAARRGGBB little-endian per pixel).
+    constexpr std::uint8_t svg = 3;  ///< UTF-8 SVG document.
+  }  // namespace cursor_shape_format
+
+  /**
+   * @brief The current host cursor shape, as published by the platform cursor watcher.
+   */
+  struct cursor_shape_t {
+    std::uint8_t format;  ///< One of cursor_shape_format.
+    std::string name;  ///< Cursor name as reported by the display server, if any.
+    std::uint16_t nominal_size;  ///< Theme nominal size in host pixels.
+    std::uint16_t width;  ///< Raster width in pixels (argb only).
+    std::uint16_t height;  ///< Raster height in pixels (argb only).
+    std::uint16_t hot_x;  ///< Hotspot X: raster pixels (argb), nominal units (svg).
+    std::uint16_t hot_y;  ///< Hotspot Y.
+    std::vector<std::uint8_t> data;  ///< Raster or SVG bytes.
+    std::uint64_t generation;  ///< Monotonically increasing; changes whenever the shape changes.
+  };
+
+  /**
+   * @brief Check whether this platform can report cursor shapes.
+   * @return `true` if cursor_shape_start() will produce shapes.
+   */
+  bool cursor_shape_supported();
+
+  /**
+   * @brief Start watching the host cursor shape. Idempotent.
+   */
+  void cursor_shape_start();
+
+  /**
+   * @brief Stop watching the host cursor shape. Idempotent.
+   */
+  void cursor_shape_stop();
+
+  /**
+   * @brief Get the most recently observed cursor shape.
+   * @return The current shape, or `nullptr` if the watcher isn't running or hasn't observed one yet.
+   */
+  std::shared_ptr<const cursor_shape_t> current_cursor_shape();
 
   struct gamepad_state_t {
     std::uint32_t buttonFlags;

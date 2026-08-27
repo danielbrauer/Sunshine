@@ -530,7 +530,21 @@ namespace platf {
   std::unique_ptr<high_precision_timer> create_high_precision_timer() {
     return std::make_unique<macos_high_precision_timer>();
   }
+  bool cursor_shape_supported() {
+    return false;
+  }
+
+  void cursor_shape_start() {
+  }
+
+  void cursor_shape_stop() {
+  }
+
+  std::shared_ptr<const cursor_shape_t> current_cursor_shape() {
+    return nullptr;
+  }
 }  // namespace platf
+
 
 namespace dyn {
   void *handle(const std::vector<const char *> &libs) {

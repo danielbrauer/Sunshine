@@ -143,6 +143,7 @@ namespace config {
     int max_bitrate;  // Maximum bitrate, sets ceiling in kbps for bitrate requested from client
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
     bool capture_on_damage;  ///< NvFBC only: allow damage-driven capture (push model, framerate as a ceiling instead of a clock). Active while the host cursor is hidden (Ctrl+Alt+Shift+N); with the cursor shown the stock fixed-interval capture is used, so the shortcut doubles as a live A/B switch.
+    std::string cursor_theme;  ///< Xcursor theme used to look up high-resolution cursor images for cursor shape updates. Empty = detect from XSETTINGS / XCURSOR_THEME / Xcursor.theme.
   };
 
   struct audio_t {

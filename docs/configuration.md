@@ -1444,6 +1444,33 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### cursor_theme
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Linux/X11 only. When a client draws its own cursor (Moonlight with cursor shape support), Sunshine sends the
+            host cursor's name instead of compositing it into the video. Cursors that have no native equivalent on the
+            client are sent as the largest image the Xcursor theme ships for that name. This option overrides the theme
+            used for that lookup; leave it empty to detect the theme from XSETTINGS, `XCURSOR_THEME`, or the
+            `Xcursor.theme` X resource.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            (empty; auto-detect)
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            cursor_theme = Adwaita
+            @endcode</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp

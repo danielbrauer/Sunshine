@@ -34,6 +34,9 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "vaapi.h"
+#ifdef SUNSHINE_BUILD_X11
+  #include "cursor_shape.h"
+#endif
 
 #ifdef __GNUC__
   #define SUNSHINE_GNUC_EXTENSION __extension__
@@ -852,6 +855,34 @@ namespace platf {
     }
 #endif
     return {};
+  }
+
+  bool cursor_shape_supported() {
+#ifdef SUNSHINE_BUILD_X11
+    return x11::cursor_shape_supported();
+#else
+    return false;
+#endif
+  }
+
+  void cursor_shape_start() {
+#ifdef SUNSHINE_BUILD_X11
+    x11::cursor_shape_start();
+#endif
+  }
+
+  void cursor_shape_stop() {
+#ifdef SUNSHINE_BUILD_X11
+    x11::cursor_shape_stop();
+#endif
+  }
+
+  std::shared_ptr<const cursor_shape_t> current_cursor_shape() {
+#ifdef SUNSHINE_BUILD_X11
+    return x11::current_cursor_shape();
+#else
+    return nullptr;
+#endif
   }
 
   /**
