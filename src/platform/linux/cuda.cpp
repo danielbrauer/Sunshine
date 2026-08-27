@@ -3,9 +3,11 @@
  * @brief Definitions for CUDA encoding.
  */
 // standard includes
+#include <algorithm>
 #include <bitset>
 #include <fcntl.h>
 #include <filesystem>
+#include <optional>
 #include <thread>
 
 // lib includes
@@ -21,6 +23,7 @@ extern "C" {
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "src/config.h"
 #include "src/logging.h"
 #include "src/utility.h"
 #include "src/video.h"
@@ -730,6 +733,12 @@ namespace cuda {
 
         delay = std::chrono::nanoseconds {1s} / config.framerate;
 
+        damage_mode = config::video.capture_on_damage;
+        // Upper bound on how long a blocking grab waits for new content before handing back the
+        // previous frame. The encoder thread has its own minimum-fps fallback for static content,
+        // so this only bounds how often the capture loop wakes up to service shutdown/reinit.
+        damage_timeout = 100ms;
+
         capture_params = NVFBC_CREATE_CAPTURE_SESSION_PARAMS {NVFBC_CREATE_CAPTURE_SESSION_PARAMS_VER};
 
         capture_params.eCaptureType = NVFBC_CAPTURE_SHARED_CUDA;
@@ -780,22 +789,59 @@ namespace cuda {
         });
 
         sleep_overshoot_logger.reset();
+        grab_wait_logger.reset();
+        frame_interval_logger.reset();
+        last_frame_time.reset();
+
+        // Damage-driven mode: earliest time the next frame may be handed to the encoder.
+        auto next_allowed = std::chrono::steady_clock::now();
 
         while (true) {
-          auto now = std::chrono::steady_clock::now();
-          if (next_frame > now) {
-            std::this_thread::sleep_for(next_frame - now);
-            sleep_overshoot_logger.first_point(next_frame);
-            sleep_overshoot_logger.second_point_now_and_log();
-          }
-
-          next_frame += delay;
-          if (next_frame < now) {  // some major slowdown happened; we couldn't keep up
-            next_frame = now + delay;
-          }
-
           std::shared_ptr<platf::img_t> img_out;
-          auto status = snapshot(pull_free_image_cb, img_out, 150ms, *cursor);
+          platf::capture_e status;
+
+          // Damage-driven capture is only possible without cursor compositing, so the host cursor
+          // toggle (Ctrl+Alt+Shift+N) doubles as a live switch between the two schedulers.
+          if (damage_mode && !*cursor) {
+            // Block inside NvFBC until the display server renders new content, but never let two
+            // frames leave closer together than one frame interval so the negotiated framerate
+            // stays a ceiling. The wait (if any) happens *before* the grab, so the grab still
+            // returns the freshest frame available at that moment.
+            auto now = std::chrono::steady_clock::now();
+            if (next_allowed > now) {
+              std::this_thread::sleep_for(next_allowed - now);
+            }
+
+            auto grab_start = std::chrono::steady_clock::now();
+            status = snapshot(pull_free_image_cb, img_out, damage_timeout, *cursor);
+            auto grab_end = std::chrono::steady_clock::now();
+            // Advance the ceiling from the previous slot so grab/copy time doesn't accumulate into
+            // the interval; if we fell behind (idle, timeout) restart the cadence from now.
+            next_allowed = std::max(next_allowed + delay, grab_end);
+
+            if (status == platf::capture_e::ok) {
+              grab_wait_logger.collect_and_log(std::chrono::duration<double, std::milli>(grab_end - grab_start).count());
+              if (last_frame_time) {
+                frame_interval_logger.collect_and_log(std::chrono::duration<double, std::milli>(grab_end - *last_frame_time).count());
+              }
+              last_frame_time = grab_end;
+            }
+          } else {
+            auto now = std::chrono::steady_clock::now();
+            if (next_frame > now) {
+              std::this_thread::sleep_for(next_frame - now);
+              sleep_overshoot_logger.first_point(next_frame);
+              sleep_overshoot_logger.second_point_now_and_log();
+            }
+
+            next_frame += delay;
+            if (next_frame < now) {  // some major slowdown happened; we couldn't keep up
+              next_frame = now + delay;
+            }
+
+            status = snapshot(pull_free_image_cb, img_out, 150ms, *cursor);
+          }
+
           switch (status) {
             case platf::capture_e::reinit:
             case platf::capture_e::error:
@@ -827,6 +873,9 @@ namespace cuda {
         }
 
         cursor_visible = cursor;
+        // Damage-driven capture needs NvFBC's push model, which is only offered without cursor
+        // compositing, so it is active only while the host cursor is hidden.
+        damage_active = damage_mode && !cursor;
         if (cursor) {
           capture_params.bPushModel = nv_bool(false);
           capture_params.bWithCursor = nv_bool(true);
@@ -875,8 +924,9 @@ namespace cuda {
 
           if (!info.bDirectCapture) {
             BOOST_LOG(debug) << "Direct capture failed, trying the extra copy method"sv;
-            // Direct capture failed
-            capture_params.bPushModel = nv_bool(false);
+            // Direct capture failed. Push model is still valid without it (the X driver generates a
+            // frame per damage event), so keep it when damage-driven capture was requested.
+            capture_params.bPushModel = nv_bool(damage_active);
             capture_params.bWithCursor = nv_bool(false);
             capture_params.bAllowDirectCapture = nv_bool(false);
 
@@ -886,7 +936,21 @@ namespace cuda {
           }
         }
 
+        log_capture_mode();
         return platf::capture_e::ok;
+      }
+
+      void log_capture_mode() {
+        auto ceiling_fps = std::chrono::nanoseconds {1s} / delay;
+        BOOST_LOG(info) << "NvFBC capture mode: "sv
+                        << (capture_params.bPushModel ? "push model (frame per damage event)"sv : "timer"sv)
+                        << (capture_params.bPushModel ? "" : ", sampling every " + std::to_string(capture_params.dwSamplingRateMs) + "ms")
+                        << "; cursor "sv << (capture_params.bWithCursor ? "captured"sv : "not captured"sv)
+                        << "; direct capture "sv << (capture_params.bAllowDirectCapture ? "on"sv : "off"sv)
+                        << "; scheduling "sv << (damage_active ? "damage-driven, ceiling "sv : "fixed interval, "sv)
+                        << ceiling_fps << " fps"sv
+                        << (damage_active ? ", grab timeout " + std::to_string(damage_timeout.count()) + "ms" : "")
+                        << (damage_mode && !damage_active ? " (hide the host cursor with Ctrl+Alt+Shift+N to switch to damage-driven)" : "");
       }
 
       platf::capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor) {
@@ -900,9 +964,12 @@ namespace cuda {
         CUdeviceptr device_ptr;
         NVFBC_FRAME_GRAB_INFO info;
 
+        // Damage-driven: block until the display server renders a new frame (or the timeout
+        // expires), returning immediately if an unseen frame is already waiting.
+        // Fixed interval: never block; take whatever the display looks like right now.
         NVFBC_TOCUDA_GRAB_FRAME_PARAMS grab {
           NVFBC_TOCUDA_GRAB_FRAME_PARAMS_VER,
-          NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT,
+          damage_active ? NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY : NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT,
           &device_ptr,
           &info,
           (std::uint32_t) timeout.count(),
@@ -915,6 +982,11 @@ namespace cuda {
 
           BOOST_LOG(error) << "Couldn't capture nvFramebuffer: "sv << handle.last_error();
           return platf::capture_e::error;
+        }
+
+        if (damage_active && !info.bIsNewFrame) {
+          // Nothing changed within the timeout; the encoder's minimum-fps fallback covers static content.
+          return platf::capture_e::timeout;
         }
 
         if (!pull_free_image_cb(img_out)) {
@@ -958,6 +1030,14 @@ namespace cuda {
       }
 
       std::chrono::nanoseconds delay;
+
+      // Damage-driven capture (config: capture_on_damage). See capture()/snapshot().
+      bool damage_mode = false;  // config flag
+      bool damage_active = false;  // damage_mode && host cursor hidden; set by reinit()
+      std::chrono::milliseconds damage_timeout {100};
+      std::optional<std::chrono::steady_clock::time_point> last_frame_time;
+      logging::min_max_avg_periodic_logger<double> grab_wait_logger = {debug, "NvFBC damage-driven grab wait", "ms", 5s};
+      logging::min_max_avg_periodic_logger<double> frame_interval_logger = {debug, "NvFBC damage-driven frame interval", "ms", 5s};
 
       bool cursor_visible;
       handle_t handle;
