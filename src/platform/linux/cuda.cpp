@@ -921,6 +921,7 @@ namespace cuda {
           return platf::capture_e::interrupted;
         }
         auto img = (img_t *) img_out.get();
+        img->frame_timestamp = std::chrono::steady_clock::now();
 
         if (img->tex.copy((std::uint8_t *) device_ptr, img->height, img->row_pitch)) {
           return platf::capture_e::error;
